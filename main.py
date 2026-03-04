@@ -12,6 +12,30 @@ import pandas as pd
 import yfinance as yf
 import requests
 
+import requests
+
+@app.get("/debug/yahoo_quote")
+def debug_yahoo_quote(symbol: str = "PETKM.IS"):
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    r = requests.get(url, params={"symbols": symbol}, timeout=15)
+    return {
+        "symbol": symbol,
+        "status_code": r.status_code,
+        "headers": dict(r.headers),
+        "text_head": r.text[:300],
+    }
+
+@app.get("/debug/yahoo_chart")
+def debug_yahoo_chart(symbol: str = "PETKM.IS"):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    r = requests.get(url, params={"range": "3mo", "interval": "1d"}, timeout=15)
+    return {
+        "symbol": symbol,
+        "status_code": r.status_code,
+        "headers": dict(r.headers),
+        "text_head": r.text[:300],
+    }
+
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -756,3 +780,4 @@ def scan(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"scan failed: {type(e).__name__}: {e}")
+
