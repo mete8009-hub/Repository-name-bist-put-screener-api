@@ -4,8 +4,17 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
-  - key: PYTHON_VERSION
-    value: 3.12.3
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: CACHE_TTL_SECONDS
+        value: "600"
+      - key: YF_TIMEOUT
+        value: "35"
+      - key: YF_RETRIES
+        value: "4"
+      - key: YF_RETRY_SLEEP
+        value: "1.4"
