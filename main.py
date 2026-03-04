@@ -28,6 +28,7 @@ BASE_TICKERS_DEFAULT = [
 ]
 
 BENCH_TICKER_DEFAULT = "XU100.IS"
+BENCH_TICKER_FALLBACK = "^XU100"   # ✅ fallback
 REL_LOOKBACK_DAYS_DEFAULT = 20
 
 PERIOD_DEFAULT = "12mo"
@@ -95,6 +96,55 @@ def _cache_get(key: str):
 
 def _cache_set(key: str, val: Any):
     _cache[key] = (time.time(), val)
+
+
+# =====================================================
+# Robust download (✅ NEW)
+# =====================================================
+
+YF_TIMEOUT = int(os.getenv("YF_TIMEOUT", "25"))          # seconds
+YF_RETRIES = int(os.getenv("YF_RETRIES", "3"))           # retry count
+YF_SLEEP_BASE = float(os.getenv("YF_SLEEP_BASE", "1.2")) # backoff base seconds
+
+
+def _make_yf_session() -> requests.Session:
+    s = requests.Session()
+    # ✅ User-Agent helps a LOT on some hosts
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
+    return s
+
+
+def _download_panel_with_retry(all_tickers: List[str], period: str, interval: str) -> pd.DataFrame:
+    sess = _make_yf_session()
+
+    last_exc: Optional[Exception] = None
+    for i in range(YF_RETRIES):
+        try:
+            panel = yf.download(
+                tickers=all_tickers,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                group_by="column",
+                threads=True,
+                session=sess,
+                timeout=YF_TIMEOUT,
+            )
+            # Sometimes returns empty without raising: treat as failure and retry
+            if panel is None or panel.empty:
+                raise RuntimeError("yfinance returned empty dataframe")
+            return panel
+
+        except Exception as e:
+            last_exc = e
+            time.sleep(YF_SLEEP_BASE * (2 ** i))
+
+    # if all retries fail, return empty (caller will produce warnings)
+    return pd.DataFrame()
 
 
 # =====================================================
@@ -195,7 +245,6 @@ def bollinger_ema(close: pd.Series, length: int = 22, mult: float = 2.0):
     lower = mid - mult * std
     return mid, upper, lower
 
-
 # ----- expiry rule -----
 def month_last_day(year: int, month: int) -> int:
     if month == 12:
@@ -218,7 +267,6 @@ def expiry_by_rollover_rule(asof_date: dt.date,
         y, m = add_months(y, m, 1)
     dom = min(expiry_dom, month_last_day(y, m))
     return dt.date(y, m, dom)
-
 
 # ----- BIST strike tick + rounding -----
 def bist_pay_option_strike_tick(K: float) -> float:
@@ -273,7 +321,6 @@ def round_strike_to_bist_steps(K_raw: float, mode: str = "nearest") -> float:
         K_mkt = round_to_tick(K_mkt, tick2, mode=mode)
     return K_mkt
 
-
 # ----- Black–Scholes -----
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -327,7 +374,6 @@ def bs_put_strike_from_delta_solve(S: float, T: float, r: float, q: float, sigma
 
     return 0.5 * (lo + hi)
 
-
 # ----- RelPerf vs benchmark -----
 def compute_rel_perf_vs_bench(stock_close: pd.Series, bench_close: pd.Series, lookback: int = 20):
     if stock_close is None or bench_close is None:
@@ -351,50 +397,19 @@ def compute_rel_perf_vs_bench(stock_close: pd.Series, bench_close: pd.Series, lo
 
 
 # =====================================================
-# yfinance robust fetching (per-ticker history + headers + retry)
+# Data access helpers
 # =====================================================
+def _get_series(panel: pd.DataFrame, field: str, sym: str) -> pd.Series:
+    if panel is None or panel.empty:
+        return pd.Series(dtype=float)
+    if isinstance(panel.columns, pd.MultiIndex):
+        if field in panel.columns.levels[0] and sym in panel[field].columns:
+            return panel[field][sym].dropna()
+        return pd.Series(dtype=float)
+    if field in panel.columns:
+        return panel[field].dropna()
+    return pd.Series(dtype=float)
 
-def yf_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Connection": "keep-alive",
-    })
-    return s
-
-def fetch_ohlc_one(ticker: str, period: str, interval: str,
-                   retries: int = 4, backoff: float = 1.2) -> Optional[pd.DataFrame]:
-    """
-    Returns DataFrame with columns: Open, High, Low, Close (timezone-aware index from Yahoo).
-    Tries per-ticker history with a session to reduce blocks.
-    """
-    sess = yf_session()
-    last_err: Optional[str] = None
-
-    for i in range(retries):
-        try:
-            t = yf.Ticker(ticker, session=sess)
-            df = t.history(period=period, interval=interval, auto_adjust=False)
-            if df is not None and not df.empty:
-                need = ["Open", "High", "Low", "Close"]
-                if all(c in df.columns for c in need):
-                    out = df[need].dropna()
-                    if not out.empty:
-                        return out
-            last_err = "empty_history"
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-
-        time.sleep(backoff * (i + 1))
-
-    return None
-
-
-# =====================================================
-# Core scan
-# =====================================================
 
 def _run_scan(
     base_tickers: List[str],
@@ -435,28 +450,28 @@ def _run_scan(
     tickers = [t.strip().upper() for t in base_tickers if t.strip()]
     yahoo_tickers = [t + ".IS" if "." not in t else t for t in tickers]
 
+    # ✅ include both bench tickers in download to increase chance
+    all_tickers = yahoo_tickers + [bench_ticker, BENCH_TICKER_FALLBACK]
+
+    panel = _download_panel_with_retry(all_tickers=all_tickers, period=period, interval=interval)
+
+    # ✅ bench: prefer primary, else fallback
+    bench_close = _get_series(panel, "Close", bench_ticker)
+    if bench_close.empty:
+        bench_close = _get_series(panel, "Close", BENCH_TICKER_FALLBACK)
+
     rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
 
     run_ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # --- Fetch benchmark close once ---
-    bench_df = fetch_ohlc_one(bench_ticker, period=period, interval=interval, retries=5)
-    if bench_df is None or bench_df.empty:
+    if bench_close.empty:
         warnings.append(f"Benchmark verisi gelmedi: {bench_ticker} (RelPerf NaN kalır)")
-        bench_close = pd.Series(dtype=float)
-    else:
-        bench_close = bench_df["Close"].dropna()
 
     for base, sym in zip(tickers, yahoo_tickers):
-        ohlc = fetch_ohlc_one(sym, period=period, interval=interval, retries=5)
-        if ohlc is None or ohlc.empty:
-            warnings.append(f"OHLC verisi yok: {sym}")
-            continue
-
-        close = ohlc["Close"].dropna()
-        high  = ohlc["High"].dropna()
-        low   = ohlc["Low"].dropna()
+        close = _get_series(panel, "Close", sym)
+        high  = _get_series(panel, "High",  sym)
+        low   = _get_series(panel, "Low",   sym)
 
         if close.empty or high.empty or low.empty:
             warnings.append(f"OHLC verisi yok: {sym}")
@@ -550,10 +565,8 @@ def _run_scan(
 
         z_pen = zscore_penalty(z_last, z1, z2, z3, z_step)
         bb_pen = -10.0 if (not np.isnan(bb_score) and bb_score >= 70) else 0.0
-
         score = clamp(score_raw + z_pen + bb_pen, 0, 100)
 
-        # expiry + BS
         expiry_date = expiry_by_rollover_rule(data_asof, rollover_day=rollover_day, expiry_dom=expiry_dom)
         dte_days = int((expiry_date - data_asof).days)
         T_years = max(dte_days, 1) / 365.0
@@ -567,7 +580,6 @@ def _run_scan(
         bs_prem = bs_put_price(S=price, K=K_30, T=T_years, r=risk_free, q=div_yield, sigma=bs_sigma)
         bs_prem_pct = (bs_prem / price) * 100.0 if (price > 0 and not np.isnan(bs_prem)) else np.nan
 
-        # reasons
         reasons = []
         if risk_veto:
             reasons.append("RİSK VETO: Güçlü aşağı trend (ADX yüksek & DI- baskın)")
@@ -590,54 +602,42 @@ def _run_scan(
             "Run_Timestamp": run_ts,
             "Price": price,
             "RelPerf_XU100_%": float(rel_perf_xu100) if not np.isnan(rel_perf_xu100) else None,
-
             "SMA50": sma50_v if not np.isnan(sma50_v) else None,
             "SMA200": sma200_v if not np.isnan(sma200_v) else None,
-
             "BB_Mid(EMA22)": bb_mid_last if not np.isnan(bb_mid_last) else None,
             "BB_Upper": bb_up_last if not np.isnan(bb_up_last) else None,
             "BB_Lower": bb_low_last if not np.isnan(bb_low_last) else None,
             "BB_Skor": float(bb_score) if not np.isnan(bb_score) else None,
-
             "ZScore": z_last if not np.isnan(z_last) else None,
             "LogPrice_ZScore": z_lp_last if not np.isnan(z_lp_last) else None,
             "LogReturn_ZScore": z_lr_last if not np.isnan(z_lr_last) else None,
-
             "EMA_Diff": ema_diff if not np.isnan(ema_diff) else None,
             "EMA40 Fark (%)": ema_diff_pct if not np.isnan(ema_diff_pct) else None,
             "RSI": rsi_last if not np.isnan(rsi_last) else None,
-
             "ADX": adx_last if not np.isnan(adx_last) else None,
             "DI+": dip_last if not np.isnan(dip_last) else None,
             "DI-": din_last if not np.isnan(din_last) else None,
             "ADX_Slope": adx_slp if not np.isnan(adx_slp) else None,
-
             "StochK": k_last if not np.isnan(k_last) else None,
             "StochD": d_last if not np.isnan(d_last) else None,
             "StochCrossUp": bool(cross_up),
-
             "Risk_Veto": bool(risk_veto),
             "Setup1": bool(setup1),
             "Setup2": bool(setup2),
             "Put_Aday": bool(put_candidate),
             "Skor": score if not np.isnan(score) else None,
-
             "Expiry_30th": expiry_date.isoformat(),
             "DTE_Days": int(dte_days),
-
             "BS_Sigma": float(bs_sigma),
             "BS_TargetPutDelta": float(target_put_delta),
             "BS_RiskFree": float(risk_free),
             "BS_DivYield": float(div_yield),
-
             "BS_Strike_RAW": float(K_raw) if not np.isnan(K_raw) else None,
             "Strike_Tick": float(bist_pay_option_strike_tick(K_30)) if not np.isnan(K_30) else None,
             "Strike_Round_Mode": strike_round_mode,
-
             "BS_Strike_D30P_30th": float(K_30) if not np.isnan(K_30) else None,
             "BS_Premium_D30P_30th": float(bs_prem) if not np.isnan(bs_prem) else None,
             "BS_Premium_%Spot": float(bs_prem_pct) if not np.isnan(bs_prem_pct) else None,
-
             "Gerekce": reason_text
         })
 
@@ -659,7 +659,9 @@ def _run_scan(
             "expiry": {"rollover_day": rollover_day, "expiry_dom": expiry_dom},
             "bs": {"sigma": bs_sigma, "target_put_delta": target_put_delta, "r": risk_free, "q": div_yield},
             "strike_round_mode": strike_round_mode,
-            "cache_ttl_seconds": CACHE_TTL_SECONDS
+            "cache_ttl_seconds": CACHE_TTL_SECONDS,
+            "yf_timeout": YF_TIMEOUT,
+            "yf_retries": YF_RETRIES
         },
         "warnings": warnings,
         "rows": rows_sorted
@@ -669,7 +671,7 @@ def _run_scan(
 # =====================================================
 # FastAPI app
 # =====================================================
-app = FastAPI(title="BIST Put Screener API", version="1.0.0")
+app = FastAPI(title="BIST Put Screener API", version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
