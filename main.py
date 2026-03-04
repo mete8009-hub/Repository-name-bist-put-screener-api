@@ -10,6 +10,8 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
+
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -193,6 +195,7 @@ def bollinger_ema(close: pd.Series, length: int = 22, mult: float = 2.0):
     lower = mid - mult * std
     return mid, upper, lower
 
+
 # ----- expiry rule -----
 def month_last_day(year: int, month: int) -> int:
     if month == 12:
@@ -215,6 +218,7 @@ def expiry_by_rollover_rule(asof_date: dt.date,
         y, m = add_months(y, m, 1)
     dom = min(expiry_dom, month_last_day(y, m))
     return dt.date(y, m, dom)
+
 
 # ----- BIST strike tick + rounding -----
 def bist_pay_option_strike_tick(K: float) -> float:
@@ -269,6 +273,7 @@ def round_strike_to_bist_steps(K_raw: float, mode: str = "nearest") -> float:
         K_mkt = round_to_tick(K_mkt, tick2, mode=mode)
     return K_mkt
 
+
 # ----- Black–Scholes -----
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -322,6 +327,7 @@ def bs_put_strike_from_delta_solve(S: float, T: float, r: float, q: float, sigma
 
     return 0.5 * (lo + hi)
 
+
 # ----- RelPerf vs benchmark -----
 def compute_rel_perf_vs_bench(stock_close: pd.Series, bench_close: pd.Series, lookback: int = 20):
     if stock_close is None or bench_close is None:
@@ -345,20 +351,50 @@ def compute_rel_perf_vs_bench(stock_close: pd.Series, bench_close: pd.Series, lo
 
 
 # =====================================================
-# Data access helpers
+# yfinance robust fetching (per-ticker history + headers + retry)
 # =====================================================
-def _get_series(panel: pd.DataFrame, field: str, sym: str) -> pd.Series:
-    if panel is None or panel.empty:
-        return pd.Series(dtype=float)
-    if isinstance(panel.columns, pd.MultiIndex):
-        if field in panel.columns.levels[0] and sym in panel[field].columns:
-            return panel[field][sym].dropna()
-        return pd.Series(dtype=float)
-    # unlikely with group_by="column" for multiple tickers, but keep safe
-    if field in panel.columns:
-        return panel[field].dropna()
-    return pd.Series(dtype=float)
 
+def yf_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+    })
+    return s
+
+def fetch_ohlc_one(ticker: str, period: str, interval: str,
+                   retries: int = 4, backoff: float = 1.2) -> Optional[pd.DataFrame]:
+    """
+    Returns DataFrame with columns: Open, High, Low, Close (timezone-aware index from Yahoo).
+    Tries per-ticker history with a session to reduce blocks.
+    """
+    sess = yf_session()
+    last_err: Optional[str] = None
+
+    for i in range(retries):
+        try:
+            t = yf.Ticker(ticker, session=sess)
+            df = t.history(period=period, interval=interval, auto_adjust=False)
+            if df is not None and not df.empty:
+                need = ["Open", "High", "Low", "Close"]
+                if all(c in df.columns for c in need):
+                    out = df[need].dropna()
+                    if not out.empty:
+                        return out
+            last_err = "empty_history"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+
+        time.sleep(backoff * (i + 1))
+
+    return None
+
+
+# =====================================================
+# Core scan
+# =====================================================
 
 def _run_scan(
     base_tickers: List[str],
@@ -398,28 +434,29 @@ def _run_scan(
 
     tickers = [t.strip().upper() for t in base_tickers if t.strip()]
     yahoo_tickers = [t + ".IS" if "." not in t else t for t in tickers]
-    all_tickers = yahoo_tickers + [bench_ticker]
-
-    panel = yf.download(
-        tickers=all_tickers,
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        group_by="column"
-    )
-
-    bench_close = _get_series(panel, "Close", bench_ticker)
 
     rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
 
     run_ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # --- Fetch benchmark close once ---
+    bench_df = fetch_ohlc_one(bench_ticker, period=period, interval=interval, retries=5)
+    if bench_df is None or bench_df.empty:
+        warnings.append(f"Benchmark verisi gelmedi: {bench_ticker} (RelPerf NaN kalır)")
+        bench_close = pd.Series(dtype=float)
+    else:
+        bench_close = bench_df["Close"].dropna()
+
     for base, sym in zip(tickers, yahoo_tickers):
-        close = _get_series(panel, "Close", sym)
-        high  = _get_series(panel, "High",  sym)
-        low   = _get_series(panel, "Low",   sym)
+        ohlc = fetch_ohlc_one(sym, period=period, interval=interval, retries=5)
+        if ohlc is None or ohlc.empty:
+            warnings.append(f"OHLC verisi yok: {sym}")
+            continue
+
+        close = ohlc["Close"].dropna()
+        high  = ohlc["High"].dropna()
+        low   = ohlc["Low"].dropna()
 
         if close.empty or high.empty or low.empty:
             warnings.append(f"OHLC verisi yok: {sym}")
@@ -604,7 +641,6 @@ def _run_scan(
             "Gerekce": reason_text
         })
 
-    # sort default: score desc for convenience
     rows_sorted = sorted(rows, key=lambda r: (r.get("Skor") is not None, r.get("Skor", -1)), reverse=True)
 
     return {
@@ -635,7 +671,6 @@ def _run_scan(
 # =====================================================
 app = FastAPI(title="BIST Put Screener API", version="1.0.0")
 
-# CORS: allow Lovable / any frontend. You can restrict later.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
