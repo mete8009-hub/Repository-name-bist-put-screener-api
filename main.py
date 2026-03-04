@@ -1,9 +1,10 @@
+# main.py
 from __future__ import annotations
 
 import datetime as dt
 import math
 import os
-import random
+import socket
 import time
 from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 from typing import Dict, Any, List, Optional, Tuple
@@ -11,10 +12,8 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import requests
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
 
 # =====================================================
 # DEFAULT PARAMS (same spirit as your notebook)
@@ -73,17 +72,20 @@ EXPIRY_DAY_OF_MONTH_DEFAULT = 30
 ROLLOVER_DAY_DEFAULT = 15
 STRIKE_ROUND_MODE_DEFAULT = "nearest"  # nearest|floor|ceil
 
-
 # =====================================================
 # Runtime knobs (Render'da stabilite için)
 # =====================================================
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))   # 10 min default
-YF_TIMEOUT = int(os.getenv("YF_TIMEOUT", "35"))                 # seconds
-YF_RETRIES = int(os.getenv("YF_RETRIES", "4"))                  # retry count
-YF_SLEEP_BASE = float(os.getenv("YF_RETRY_SLEEP", "1.4"))       # seconds
-YF_BULK_TRIES = int(os.getenv("YF_BULK_TRIES", "2"))            # bulk deneme sayısı
-YF_PER_TICKER_FALLBACK = os.getenv("YF_PER_TICKER_FALLBACK", "1") == "1"
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))  # 10 min default
+YF_TIMEOUT = int(os.getenv("YF_TIMEOUT", "25"))                # seconds
+YF_RETRIES = int(os.getenv("YF_RETRIES", "3"))                 # retry count
+YF_SLEEP_BASE = float(os.getenv("YF_RETRY_SLEEP", "1.2"))      # seconds
 
+# Chunk + hard timeout
+YF_CHUNK_SIZE = int(os.getenv("YF_CHUNK_SIZE", "8"))           # 8-10 iyi
+SCAN_HARD_LIMIT_SEC = int(os.getenv("SCAN_HARD_LIMIT_SEC", "90"))
+
+# yfinance bazen kendi timeout'unu tam uygulamayabiliyor; socket timeout ekliyoruz
+socket.setdefaulttimeout(YF_TIMEOUT)
 
 # =====================================================
 # Simple in-memory cache
@@ -192,7 +194,9 @@ def clamp(x, lo=0, hi=100):
         return np.nan
 
 
-def zscore_penalty(z: float, z1: float, z2: float, z3: float, step: float) -> float:
+def zscore_penalty(z: float,
+                   z1: float, z2: float, z3: float,
+                   step: float) -> float:
     pen = 0.0
     if np.isnan(z):
         return 0.0
@@ -229,7 +233,9 @@ def add_months(year: int, month: int, add: int):
     return y, m2
 
 
-def expiry_by_rollover_rule(asof_date: dt.date, rollover_day: int = 15, expiry_dom: int = 30) -> dt.date:
+def expiry_by_rollover_rule(asof_date: dt.date,
+                            rollover_day: int = 15,
+                            expiry_dom: int = 30) -> dt.date:
     y, m = asof_date.year, asof_date.month
     if asof_date.day > rollover_day:
         y, m = add_months(y, m, 1)
@@ -313,10 +319,8 @@ def bs_put_delta(S: float, K: float, T: float, r: float, q: float, sigma: float)
     return -math.exp(-q*T) * norm_cdf(-d1)
 
 
-def bs_put_strike_from_delta_solve(
-    S: float, T: float, r: float, q: float, sigma: float,
-    target_put_delta: float, tol: float = 1e-7, max_iter: int = 80
-) -> float:
+def bs_put_strike_from_delta_solve(S: float, T: float, r: float, q: float, sigma: float,
+                                   target_put_delta: float, tol: float = 1e-7, max_iter: int = 80) -> float:
     if S <= 0 or T <= 0 or sigma <= 0:
         return np.nan
     if target_put_delta >= 0:
@@ -375,9 +379,8 @@ def compute_rel_perf_vs_bench(stock_close: pd.Series, bench_close: pd.Series, lo
 
 
 # =====================================================
-# Data access helpers (yfinance hardening)
+# Data access helpers
 # =====================================================
-
 def _get_series(panel: pd.DataFrame, field: str, sym: str) -> pd.Series:
     if panel is None or panel.empty:
         return pd.Series(dtype=float)
@@ -390,128 +393,86 @@ def _get_series(panel: pd.DataFrame, field: str, sym: str) -> pd.Series:
     return pd.Series(dtype=float)
 
 
-def _random_ua() -> str:
-    uas = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    ]
-    return random.choice(uas)
+def _chunk_list(items: List[str], size: int) -> List[List[str]]:
+    return [items[i:i+size] for i in range(0, len(items), size)]
 
 
-def _make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": _random_ua(),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
-        "Connection": "keep-alive",
-    })
-    return s
-
-
-def _yf_download_kwargs(session: Optional[requests.Session]) -> dict:
+def _download_yf(all_tickers: List[str], period: str, interval: str) -> pd.DataFrame:
     """
-    yfinance sürümüne göre session parametresi var/yok olabilir.
+    Render için daha stabil yfinance:
+    - socket timeout (global)
+    - chunk download (8 ticker)
+    - retries + backoff
+    - partial success: bir chunk bozulsa bile diğerlerini birleştir
+    - scan hard timeout
     """
-    kw = dict(
-        auto_adjust=False,
-        progress=False,
-        group_by="column",
-        threads=False,
-        timeout=YF_TIMEOUT,
-    )
-    if session is not None:
-        try:
-            # bazı sürümlerde kabul ediyor
-            kw["session"] = session
-        except Exception:
-            pass
-    return kw
+    t0 = time.time()
 
+    tickers = [t.strip() for t in all_tickers if t and t.strip()]
+    tickers = list(dict.fromkeys(tickers))  # unique, keep order
 
-def _download_bulk(all_tickers: List[str], period: str, interval: str) -> pd.DataFrame:
-    last_err: Optional[Exception] = None
-    for attempt in range(1, YF_BULK_TRIES + 1):
-        try:
-            session = _make_session()
-            panel = yf.download(
-                tickers=all_tickers,
-                period=period,
-                interval=interval,
-                **_yf_download_kwargs(session),
-            )
-            if panel is None or panel.empty:
-                raise RuntimeError("yfinance returned empty dataframe (bulk)")
-            return panel
-        except Exception as e:
-            last_err = e
-            time.sleep(YF_SLEEP_BASE * attempt + random.uniform(0.10, 0.50))
-    raise RuntimeError(f"bulk failed: {type(last_err).__name__}: {last_err}")
+    print(f"[YF] start | tickers={len(tickers)} | period={period} | interval={interval} | chunk={YF_CHUNK_SIZE} | timeout={YF_TIMEOUT}s")
 
+    chunks = _chunk_list(tickers, YF_CHUNK_SIZE)
+    panels: List[pd.DataFrame] = []
+    warnings_local: List[str] = []
 
-def _download_one(sym: str, period: str, interval: str) -> pd.DataFrame:
-    last_err: Optional[Exception] = None
-    for attempt in range(1, YF_RETRIES + 1):
-        try:
-            session = _make_session()
-            df1 = yf.download(
-                tickers=sym,
-                period=period,
-                interval=interval,
-                **_yf_download_kwargs(session),
-            )
-            if df1 is None or df1.empty:
-                raise RuntimeError("yfinance returned empty dataframe (single)")
-            return df1
-        except Exception as e:
-            last_err = e
-            time.sleep(YF_SLEEP_BASE * attempt + random.uniform(0.05, 0.35))
-    raise RuntimeError(f"{sym} failed after retries: {type(last_err).__name__}: {last_err}")
+    for ci, ch in enumerate(chunks, start=1):
+        if (time.time() - t0) > SCAN_HARD_LIMIT_SEC:
+            raise RuntimeError(f"scan hard timeout: exceeded {SCAN_HARD_LIMIT_SEC}s before finishing downloads")
 
+        last_err: Optional[Exception] = None
+        ok = False
 
-def _download_yf(all_tickers: List[str], period: str, interval: str) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Returns: (panel, warnings)
-    - 1) bulk try
-    - 2) if bulk fails/empty: per-ticker fallback (partial success allowed)
-    """
-    warnings: List[str] = []
+        for attempt in range(1, YF_RETRIES + 1):
+            if (time.time() - t0) > SCAN_HARD_LIMIT_SEC:
+                raise RuntimeError(f"scan hard timeout: exceeded {SCAN_HARD_LIMIT_SEC}s during retries")
 
-    # 1) BULK
-    try:
-        panel = _download_bulk(all_tickers=all_tickers, period=period, interval=interval)
-        return panel, warnings
-    except Exception as e:
-        warnings.append(f"yfinance bulk indirilemedi, fallback'e geçildi: {type(e).__name__}: {e}")
+            try:
+                print(f"[YF] chunk {ci}/{len(chunks)} attempt {attempt}/{YF_RETRIES} | {ch}")
+                p = yf.download(
+                    tickers=ch,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=False,
+                    progress=False,
+                    group_by="column",
+                    threads=False,
+                    timeout=YF_TIMEOUT,
+                )
 
-    # 2) FALLBACK
-    if not YF_PER_TICKER_FALLBACK:
-        raise RuntimeError("yfinance bulk failed and per-ticker fallback disabled")
+                if p is None or p.empty:
+                    raise RuntimeError("yfinance returned empty dataframe")
 
-    frames: List[pd.DataFrame] = []
-    for sym in all_tickers:
-        try:
-            df1 = _download_one(sym, period, interval)
-            # df1 columns => single-level; convert to MultiIndex (field, ticker)
-            df1.columns = pd.MultiIndex.from_product([df1.columns, [sym]])
-            frames.append(df1)
-            time.sleep(random.uniform(0.05, 0.25))
-        except Exception as e:
-            warnings.append(f"Ticker indirilemedi: {sym} -> {type(e).__name__}: {e}")
+                panels.append(p)
+                ok = True
+                print(f"[YF] chunk {ci} OK | shape={p.shape} | elapsed={time.time()-t0:.1f}s")
+                break
 
-    if not frames:
-        raise RuntimeError("yfinance fallback: hiçbir ticker indirilemedi (frames boş).")
+            except Exception as e:
+                last_err = e
+                sleep_s = YF_SLEEP_BASE * attempt
+                print(f"[YF] chunk {ci} FAIL | {type(e).__name__}: {e} | sleep={sleep_s:.1f}s")
+                time.sleep(sleep_s)
 
-    panel2 = pd.concat(frames, axis=1).sort_index()
-    if panel2.empty:
-        raise RuntimeError("yfinance fallback: panel boş geldi.")
-    return panel2, warnings
+        if not ok:
+            warnings_local.append(f"Chunk {ci} failed: {ch} | last_err={type(last_err).__name__}: {last_err}")
 
+    if not panels:
+        raise RuntimeError("yfinance download failed: no chunks succeeded")
 
-# =====================================================
-# Core scan
-# =====================================================
+    panel = pd.concat(panels, axis=1)
+    panel = panel.loc[:, ~panel.columns.duplicated()]
+
+    if panel is None or panel.empty:
+        raise RuntimeError("yfinance returned empty dataframe after concat")
+
+    if warnings_local:
+        print("[YF] WARN:", " || ".join(warnings_local))
+
+    print(f"[YF] DONE | final_shape={panel.shape} | total_elapsed={time.time()-t0:.1f}s")
+    return panel
+
 
 def _run_scan(
     base_tickers: List[str],
@@ -549,16 +510,17 @@ def _run_scan(
     strike_round_mode: str,
 ) -> Dict[str, Any]:
 
-    tickers = [t.strip().upper() for t in base_tickers if t.strip()]
+    tickers = [t.strip().upper() for t in base_tickers if t and t.strip()]
     yahoo_tickers = [t + ".IS" if "." not in t else t for t in tickers]
     all_tickers = yahoo_tickers + [bench_ticker]
 
-    panel, dl_warnings = _download_yf(all_tickers=all_tickers, period=period, interval=interval)
+    panel = _download_yf(all_tickers=all_tickers, period=period, interval=interval)
+    print(f"[SCAN] panel rows={len(panel)} cols={len(panel.columns)}")
 
     bench_close = _get_series(panel, "Close", bench_ticker)
 
     rows: List[Dict[str, Any]] = []
-    warnings: List[str] = list(dl_warnings)
+    warnings: List[str] = []
 
     if bench_close.empty:
         warnings.append(f"Benchmark verisi gelmedi: {bench_ticker} (RelPerf NaN kalır)")
@@ -632,7 +594,6 @@ def _run_scan(
 
         rel_perf_xu100 = compute_rel_perf_vs_bench(close, bench_close, lookback=rel_lookback_days)
 
-        # SETUP / VETO
         setup1 = (
             (adx_last <= adx_flat_max) and
             (dip_last >= din_last) and
@@ -654,7 +615,6 @@ def _run_scan(
 
         put_candidate = (not risk_veto) and (setup1 or setup2)
 
-        # SCORE
         score_raw = 0.0
         score_raw += w_flat_trend * (1 - min(adx_last, 40) / 40)
         score_raw += w_di_support * (1 if dip_last >= din_last else 0)
@@ -667,7 +627,6 @@ def _run_scan(
 
         score = clamp(score_raw + z_pen + bb_pen, 0, 100)
 
-        # expiry + BS
         expiry_date = expiry_by_rollover_rule(data_asof, rollover_day=rollover_day, expiry_dom=expiry_dom)
         dte_days = int((expiry_date - data_asof).days)
         T_years = max(dte_days, 1) / 365.0
@@ -681,7 +640,6 @@ def _run_scan(
         bs_prem = bs_put_price(S=price, K=K_30, T=T_years, r=risk_free, q=div_yield, sigma=bs_sigma)
         bs_prem_pct = (bs_prem / price) * 100.0 if (price > 0 and not np.isnan(bs_prem)) else np.nan
 
-        # reasons
         reasons = []
         if risk_veto:
             reasons.append("RİSK VETO: Güçlü aşağı trend (ADX yüksek & DI- baskın)")
@@ -735,7 +693,7 @@ def _run_scan(
             "Setup1": bool(setup1),
             "Setup2": bool(setup2),
             "Put_Aday": bool(put_candidate),
-            "Skor": float(score) if not np.isnan(score) else None,
+            "Skor": score if not np.isnan(score) else None,
 
             "Expiry_30th": expiry_date.isoformat(),
             "DTE_Days": int(dte_days),
@@ -756,11 +714,7 @@ def _run_scan(
             "Gerekce": reason_text
         })
 
-    rows_sorted = sorted(
-        rows,
-        key=lambda r: (r.get("Skor") is not None, r.get("Skor") if r.get("Skor") is not None else -1),
-        reverse=True
-    )
+    rows_sorted = sorted(rows, key=lambda r: (r.get("Skor") is not None, r.get("Skor", -1)), reverse=True)
 
     return {
         "run_ts": run_ts,
@@ -781,8 +735,8 @@ def _run_scan(
             "cache_ttl_seconds": CACHE_TTL_SECONDS,
             "yf_timeout": YF_TIMEOUT,
             "yf_retries": YF_RETRIES,
-            "yf_bulk_tries": YF_BULK_TRIES,
-            "yf_per_ticker_fallback": YF_PER_TICKER_FALLBACK,
+            "yf_chunk_size": YF_CHUNK_SIZE,
+            "scan_hard_limit_sec": SCAN_HARD_LIMIT_SEC
         },
         "warnings": warnings,
         "rows": rows_sorted
@@ -823,9 +777,7 @@ def scan(
     interval: str = Query(default=INTERVAL_DEFAULT),
 ):
     try:
-        base_tickers = BASE_TICKERS_DEFAULT if not tickers else [
-            t.strip().upper() for t in tickers.split(",") if t.strip()
-        ]
+        base_tickers = BASE_TICKERS_DEFAULT if not tickers else [t.strip().upper() for t in tickers.split(",") if t.strip()]
         if not base_tickers:
             raise HTTPException(status_code=400, detail="tickers list is empty")
 
