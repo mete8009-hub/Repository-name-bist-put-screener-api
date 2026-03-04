@@ -1,7 +1,11 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-yfinance==0.2.43
+
 pandas==2.2.2
 numpy==1.26.4
+
+yfinance>=0.2.52
 requests==2.32.3
-requests
+
+# Yahoo tarafı blok/rate-limit durumlarında bazı ortamlarda yardımcı olabiliyor
+curl_cffi>=0.7.0
