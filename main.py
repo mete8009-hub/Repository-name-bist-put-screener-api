@@ -9,11 +9,18 @@ import time
 from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 from typing import Dict, Any, List, Optional, Tuple
 
+from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
+# =====================================================
+# TIMEZONE (Render/Server UTC -> TR)
+# =====================================================
+TR_TZ = ZoneInfo(os.getenv("APP_TZ", "Europe/Istanbul"))
 
 # =====================================================
 # DEFAULT PARAMS (same spirit as your notebook)
@@ -319,8 +326,10 @@ def bs_put_delta(S: float, K: float, T: float, r: float, q: float, sigma: float)
     return -math.exp(-q*T) * norm_cdf(-d1)
 
 
-def bs_put_strike_from_delta_solve(S: float, T: float, r: float, q: float, sigma: float,
-                                   target_put_delta: float, tol: float = 1e-7, max_iter: int = 80) -> float:
+def bs_put_strike_from_delta_solve(
+    S: float, T: float, r: float, q: float, sigma: float,
+    target_put_delta: float, tol: float = 1e-7, max_iter: int = 80
+) -> float:
     if S <= 0 or T <= 0 or sigma <= 0:
         return np.nan
     if target_put_delta >= 0:
@@ -385,8 +394,11 @@ def _get_series(panel: pd.DataFrame, field: str, sym: str) -> pd.Series:
     if panel is None or panel.empty:
         return pd.Series(dtype=float)
     if isinstance(panel.columns, pd.MultiIndex):
-        if field in panel.columns.levels[0] and sym in panel[field].columns:
-            return panel[field][sym].dropna()
+        # yfinance output often: (PriceField, Ticker)
+        if field in panel.columns.levels[0]:
+            sub = panel[field]
+            if isinstance(sub, pd.DataFrame) and sym in sub.columns:
+                return sub[sym].dropna()
         return pd.Series(dtype=float)
     if field in panel.columns:
         return panel[field].dropna()
@@ -411,7 +423,10 @@ def _download_yf(all_tickers: List[str], period: str, interval: str) -> pd.DataF
     tickers = [t.strip() for t in all_tickers if t and t.strip()]
     tickers = list(dict.fromkeys(tickers))  # unique, keep order
 
-    print(f"[YF] start | tickers={len(tickers)} | period={period} | interval={interval} | chunk={YF_CHUNK_SIZE} | timeout={YF_TIMEOUT}s")
+    print(
+        f"[YF] start | tickers={len(tickers)} | period={period} | interval={interval} "
+        f"| chunk={YF_CHUNK_SIZE} | timeout={YF_TIMEOUT}s"
+    )
 
     chunks = _chunk_list(tickers, YF_CHUNK_SIZE)
     panels: List[pd.DataFrame] = []
@@ -419,14 +434,18 @@ def _download_yf(all_tickers: List[str], period: str, interval: str) -> pd.DataF
 
     for ci, ch in enumerate(chunks, start=1):
         if (time.time() - t0) > SCAN_HARD_LIMIT_SEC:
-            raise RuntimeError(f"scan hard timeout: exceeded {SCAN_HARD_LIMIT_SEC}s before finishing downloads")
+            raise RuntimeError(
+                f"scan hard timeout: exceeded {SCAN_HARD_LIMIT_SEC}s before finishing downloads"
+            )
 
         last_err: Optional[Exception] = None
         ok = False
 
         for attempt in range(1, YF_RETRIES + 1):
             if (time.time() - t0) > SCAN_HARD_LIMIT_SEC:
-                raise RuntimeError(f"scan hard timeout: exceeded {SCAN_HARD_LIMIT_SEC}s during retries")
+                raise RuntimeError(
+                    f"scan hard timeout: exceeded {SCAN_HARD_LIMIT_SEC}s during retries"
+                )
 
             try:
                 print(f"[YF] chunk {ci}/{len(chunks)} attempt {attempt}/{YF_RETRIES} | {ch}")
@@ -456,7 +475,9 @@ def _download_yf(all_tickers: List[str], period: str, interval: str) -> pd.DataF
                 time.sleep(sleep_s)
 
         if not ok:
-            warnings_local.append(f"Chunk {ci} failed: {ch} | last_err={type(last_err).__name__}: {last_err}")
+            warnings_local.append(
+                f"Chunk {ci} failed: {ch} | last_err={type(last_err).__name__}: {last_err}"
+            )
 
     if not panels:
         raise RuntimeError("yfinance download failed: no chunks succeeded")
@@ -525,7 +546,11 @@ def _run_scan(
     if bench_close.empty:
         warnings.append(f"Benchmark verisi gelmedi: {bench_ticker} (RelPerf NaN kalır)")
 
-    run_ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # TZ-aware timestamps
+    run_dt_tr = dt.datetime.now(TR_TZ)
+    run_dt_utc = dt.datetime.now(dt.timezone.utc)
+    run_ts = run_dt_tr.isoformat(timespec="seconds")      # 2026-03-05T13:27:10+03:00
+    run_ts_utc = run_dt_utc.isoformat(timespec="seconds")  # 2026-03-05T10:27:10+00:00
 
     for base, sym in zip(tickers, yahoo_tickers):
         close = _get_series(panel, "Close", sym)
@@ -561,8 +586,8 @@ def _run_scan(
         z_lr = zscore_logreturn(close, window=window_z)
         z_lr_last = float(z_lr.iloc[-1])
 
-        ema40 = close.ewm(span=window_z, adjust=False).mean()
-        ema_last = float(ema40.iloc[-1])
+        emaN = close.ewm(span=window_z, adjust=False).mean()
+        ema_last = float(emaN.iloc[-1])
         ema_diff = (price - ema_last) / ema_last
         ema_diff_pct = ema_diff * 100.0
 
@@ -659,7 +684,8 @@ def _run_scan(
         rows.append({
             "Hisse": base,
             "Data_AsOf": data_asof.isoformat(),
-            "Run_Timestamp": run_ts,
+            "Run_Timestamp": run_ts,          # TZ-aware
+            "Run_Timestamp_UTC": run_ts_utc,  # debug
             "Price": price,
 
             "RelPerf_XU100_%": float(rel_perf_xu100) if not np.isnan(rel_perf_xu100) else None,
@@ -714,10 +740,16 @@ def _run_scan(
             "Gerekce": reason_text
         })
 
-    rows_sorted = sorted(rows, key=lambda r: (r.get("Skor") is not None, r.get("Skor", -1)), reverse=True)
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (r.get("Skor") is not None, r.get("Skor", -1)),
+        reverse=True
+    )
 
     return {
-        "run_ts": run_ts,
+        "run_ts": run_ts,              # TR timezone-aware
+        "run_ts_utc": run_ts_utc,      # debug
+        "tz": str(TR_TZ),
         "data_asof": rows_sorted[0]["Data_AsOf"] if rows_sorted else None,
         "params": {
             "bench_ticker": bench_ticker,
@@ -746,7 +778,7 @@ def _run_scan(
 # =====================================================
 # FastAPI app
 # =====================================================
-app = FastAPI(title="BIST Put Screener API", version="1.2.0")
+app = FastAPI(title="BIST Put Screener API", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -759,12 +791,21 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "bist-put-screener", "ts": dt.datetime.now().isoformat()}
+    return {
+        "ok": True,
+        "service": "bist-put-screener",
+        "ts": dt.datetime.now(TR_TZ).isoformat(timespec="seconds"),
+        "tz": str(TR_TZ),
+    }
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": dt.datetime.now().isoformat()}
+    return {
+        "ok": True,
+        "ts": dt.datetime.now(TR_TZ).isoformat(timespec="seconds"),
+        "tz": str(TR_TZ),
+    }
 
 
 @app.get("/scan")
@@ -777,10 +818,13 @@ def scan(
     interval: str = Query(default=INTERVAL_DEFAULT),
 ):
     try:
-        base_tickers = BASE_TICKERS_DEFAULT if not tickers else [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        base_tickers = BASE_TICKERS_DEFAULT if not tickers else [
+            t.strip().upper() for t in tickers.split(",") if t.strip()
+        ]
         if not base_tickers:
             raise HTTPException(status_code=400, detail="tickers list is empty")
 
+        # cache key includes period/interval + tickers
         cache_key = f"scan|{','.join(base_tickers)}|{period}|{interval}"
         cached = _cache_get(cache_key)
         if cached is not None:
